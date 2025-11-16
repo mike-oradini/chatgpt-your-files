@@ -137,6 +137,8 @@ export interface Database {
         Args: {
           embedding: string
           match_threshold: number
+          document_ids?: number[] | null
+          match_count?: number | null
         }
         Returns: {
           content: string
