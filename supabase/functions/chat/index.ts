@@ -12,6 +12,15 @@ const openai = new OpenAI({
 const supabaseUrl = Deno.env.get('SUPABASE_URL');
 const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
 
+const DEFAULT_SESSION_INSTRUCTIONS = `
+You're an AI assistant that answers questions strictly using the provided documents.
+
+Keep replies concise, stay on task, and highlight knowledge gaps rather than inventing answers.
+
+If a question is unrelated to the documents (or the docs do not contain the answer), respond with:
+"Sorry, I couldn't find any information on that."
+`.trim();
+
 export const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers':
@@ -47,73 +56,75 @@ Deno.serve(async (req) => {
     );
   }
 
-  const supabase = createClient<Database>(supabaseUrl, supabaseAnonKey, {
-    global: {
-      headers: {
-        authorization,
+    const supabase = createClient<Database>(supabaseUrl, supabaseAnonKey, {
+      global: {
+        headers: {
+          authorization,
+        },
       },
-    },
-    auth: {
-      persistSession: false,
-    },
-  });
-
-  const { messages, embedding } = await req.json();
-
-  const { data: documents, error: matchError } = await supabase
-    .rpc('match_document_sections', {
-      embedding,
-      match_threshold: 0.8,
-    })
-    .select('content')
-    .limit(5);
-
-  if (matchError) {
-    console.error(matchError);
-
-    return new Response(
-      JSON.stringify({
-        error: 'There was an error reading your documents, please try again.',
-      }),
-      {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      }
-    );
-  }
-
-  const injectedDocs =
-    documents && documents.length > 0
-      ? documents.map(({ content }) => content).join('\n\n')
-      : 'No documents found';
-
-  console.log(injectedDocs);
-
-  const completionMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
-    [
-      {
-        role: 'user',
-        content: codeBlock`
-        You're an AI assistant who answers questions about documents.
-
-        You're a chat bot, so keep your replies succinct.
-
-        You're only allowed to use the documents below to answer the question.
-
-        If the question isn't related to these documents, say:
-        "Sorry, I couldn't find any information on that."
-
-        If the information isn't available in the below documents, say:
-        "Sorry, I couldn't find any information on that."
-
-        Do not go off topic.
-
-        Documents:
-        ${injectedDocs}
-      `,
+      auth: {
+        persistSession: false,
       },
-      ...messages,
-    ];
+    });
+
+    const { messages, embedding, document_ids, instructions, match_count } =
+      await req.json();
+
+    const matchArgs: Database['public']['Functions']['match_document_sections']['Args'] =
+      {
+        embedding,
+        match_threshold: 0.8,
+      };
+
+    if (Array.isArray(document_ids) && document_ids.length > 0) {
+      matchArgs.document_ids = document_ids;
+    }
+
+    if (typeof match_count === 'number' && Number.isFinite(match_count)) {
+      matchArgs.match_count = match_count;
+    }
+
+    const { data: documents, error: matchError } = await supabase
+      .rpc('match_document_sections', matchArgs)
+      .select('content');
+
+    if (matchError) {
+      console.error(matchError);
+
+      return new Response(
+        JSON.stringify({
+          error: 'There was an error reading your documents, please try again.',
+        }),
+        {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+    }
+
+    const injectedDocs =
+      documents && documents.length > 0
+        ? documents.map(({ content }) => content).join('\n\n')
+        : 'No documents found';
+
+    const sessionInstructions =
+      typeof instructions === 'string' && instructions.trim().length > 0
+        ? instructions.trim()
+        : DEFAULT_SESSION_INSTRUCTIONS;
+
+    const completionMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
+      [
+        {
+          role: 'user',
+          content: codeBlock`
+          ${sessionInstructions}
+
+          Documents:
+          ${injectedDocs}
+        `,
+        },
+        ...messages,
+      ];
 
   const completionStream = await openai.chat.completions.create({
     model: 'gpt-3.5-turbo-0125',
